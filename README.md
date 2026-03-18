@@ -30,6 +30,17 @@ Just iterating the defined targets and signaling/handling if the worker is not f
 
 Handlers are called asynchronously (goroutine), so they don't block monitoring.
 
+If the handler is defined with a "http(s)" prefix, it will be called as an HTTP POST request with JSON payload. Otherwise it will be called as a local script.
+
+Example script receiving the payload:
+
+```bash
+#!/bin/bash
+PAYLOAD="$1"
+echo "Lost worker alert: $PAYLOAD"
+# Parse with jq, Python, etc.
+```
+
 Example payload for `lost_worker`:
 
 ```json

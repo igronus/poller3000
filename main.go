@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -119,8 +121,8 @@ type RedundantWorkerPayload struct {
 	PollerCount  int    `json:"poller_count"`
 }
 
-func callHandler(url string, payload interface{}) {
-	if url == "" {
+func callHandler(handler string, payload interface{}) {
+	if handler == "" {
 		return
 	}
 
@@ -130,17 +132,28 @@ func callHandler(url string, payload interface{}) {
 		return
 	}
 
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
-	if err != nil {
-		log.Printf("Error calling handler %s: %v", url, err)
-		return
-	}
-	defer resp.Body.Close()
+	if strings.HasPrefix(handler, "http://") || strings.HasPrefix(handler, "https://") {
+		resp, err := http.Post(handler, "application/json", bytes.NewBuffer(body))
+		if err != nil {
+			log.Printf("Error calling handler %s: %v", handler, err)
+			return
+		}
+		defer resp.Body.Close()
 
-	if resp.StatusCode >= 400 {
-		log.Printf("Handler %s returned error status: %d", url, resp.StatusCode)
+		if resp.StatusCode >= 400 {
+			log.Printf("Handler %s returned error status: %d", handler, resp.StatusCode)
+		} else {
+			log.Printf("Handler %s called successfully", handler)
+		}
 	} else {
-		log.Printf("Handler %s called successfully", url)
+		cmd := exec.Command(handler, string(body))
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			log.Printf("Error executing handler %s: %v", handler, err)
+		} else {
+			log.Printf("Handler %s executed successfully", handler)
+		}
 	}
 }
 
