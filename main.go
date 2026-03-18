@@ -242,6 +242,17 @@ func checkRunningWithNoPollers(ctx context.Context, tc *TemporalClient) {
 }
 
 func checkCompletedWithPollers(ctx context.Context, tc *TemporalClient) {
+	runningWorkflows, err := getWorkflowsByStatus(ctx, tc.Client, tc.Namespace, "Running")
+	if err != nil {
+		log.Printf("[%s/%s] Error getting running workflows: %v", tc.Host, tc.Namespace, err)
+		return
+	}
+
+	runningTaskQueues := make(map[string]bool)
+	for _, wf := range runningWorkflows {
+		runningTaskQueues[wf.TaskQueue] = true
+	}
+
 	statuses := []string{"Completed", "Terminated", "Canceled", "Failed"}
 
 	for _, status := range statuses {
@@ -259,6 +270,10 @@ func checkCompletedWithPollers(ctx context.Context, tc *TemporalClient) {
 
 		for _, wf := range workflows {
 			if wf.TaskQueue == "" {
+				continue
+			}
+
+			if runningTaskQueues[wf.TaskQueue] {
 				continue
 			}
 
