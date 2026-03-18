@@ -1,0 +1,8 @@
+temporal:
+  host: "localhost"
+  port: 7233
+  namespace: "default"
+
+monitoring:
+  poll_interval_seconds: 30
+  log_level: "info"
