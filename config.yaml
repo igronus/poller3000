@@ -1,8 +1,11 @@
 temporal:
-  host: "localhost"
-  port: 7233
-  namespace: "default"
+  targets:
+    - host: "localhost"
+      port: 7233
+      namespace: "default"
+    - host: "prod.temporal.io"
+      port: 7233
+      namespace: "production"
 
 monitoring:
   poll_interval_seconds: 30
-  log_level: "info"
