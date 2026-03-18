@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -21,12 +24,18 @@ type Target struct {
 	Namespace string `yaml:"namespace"`
 }
 
+type Handlers struct {
+	LostWorker      string `yaml:"lost_worker"`
+	RedundantWorker string `yaml:"redundant_worker"`
+}
+
 type Config struct {
 	Temporal struct {
 		Targets []Target `yaml:"targets"`
 	} `yaml:"temporal"`
 	Monitoring struct {
-		PollIntervalSeconds int `yaml:"poll_interval_seconds"`
+		PollIntervalSeconds int      `yaml:"poll_interval_seconds"`
+		Handlers            Handlers `yaml:"handlers"`
 	} `yaml:"monitoring"`
 }
 
@@ -88,6 +97,53 @@ func connectToTarget(target Target) (*TemporalClient, error) {
 	}, nil
 }
 
+type LostWorkerPayload struct {
+	Host         string `json:"host"`
+	Port         int    `json:"port"`
+	Namespace    string `json:"namespace"`
+	WorkflowID   string `json:"workflow_id"`
+	RunID        string `json:"run_id"`
+	WorkflowType string `json:"workflow_type"`
+	TaskQueue    string `json:"task_queue"`
+}
+
+type RedundantWorkerPayload struct {
+	Host         string `json:"host"`
+	Port         int    `json:"port"`
+	Namespace    string `json:"namespace"`
+	WorkflowID   string `json:"workflow_id"`
+	RunID        string `json:"run_id"`
+	WorkflowType string `json:"workflow_type"`
+	TaskQueue    string `json:"task_queue"`
+	Status       string `json:"status"`
+	PollerCount  int    `json:"poller_count"`
+}
+
+func callHandler(url string, payload interface{}) {
+	if url == "" {
+		return
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Error marshaling payload: %v", err)
+		return
+	}
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		log.Printf("Error calling handler %s: %v", url, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		log.Printf("Handler %s returned error status: %d", url, resp.StatusCode)
+	} else {
+		log.Printf("Handler %s called successfully", url)
+	}
+}
+
 func getTaskQueuePollers(ctx context.Context, service workflowservice.WorkflowServiceClient, namespace, taskQueue string) (int, error) {
 	resp, err := service.DescribeTaskQueue(ctx, &workflowservice.DescribeTaskQueueRequest{
 		Namespace:     namespace,
@@ -133,7 +189,7 @@ func getWorkflowsByStatus(ctx context.Context, c client.Client, namespace, statu
 	return workflows, nil
 }
 
-func checkRunningWithNoPollers(ctx context.Context, tc *TemporalClient) {
+func checkRunningWithNoPollers(ctx context.Context, tc *TemporalClient, handlers *Handlers) {
 	runningWorkflows, err := getWorkflowsByStatus(ctx, tc.Client, tc.Namespace, "Running")
 	if err != nil {
 		log.Printf("[%s/%s] Error getting running workflows: %v", tc.Host, tc.Namespace, err)
@@ -156,11 +212,22 @@ func checkRunningWithNoPollers(ctx context.Context, tc *TemporalClient) {
 		if pollerCount == 0 {
 			log.Printf("[ALERT] [%s/%s] Running workflow '%s' (type: %s) on task queue '%s' has NO pollers",
 				tc.Host, tc.Namespace, wf.WorkflowID, wf.WorkflowType, wf.TaskQueue)
+
+			payload := LostWorkerPayload{
+				Host:         tc.Host,
+				Port:         tc.Port,
+				Namespace:    tc.Namespace,
+				WorkflowID:   wf.WorkflowID,
+				RunID:        wf.RunID,
+				WorkflowType: wf.WorkflowType,
+				TaskQueue:    wf.TaskQueue,
+			}
+			go callHandler(handlers.LostWorker, payload)
 		}
 	}
 }
 
-func checkCompletedWithPollers(ctx context.Context, tc *TemporalClient) {
+func checkCompletedWithPollers(ctx context.Context, tc *TemporalClient, handlers *Handlers) {
 	statuses := []string{"Completed", "Terminated", "Canceled", "Failed"}
 
 	for _, status := range statuses {
@@ -190,6 +257,19 @@ func checkCompletedWithPollers(ctx context.Context, tc *TemporalClient) {
 			if pollerCount > 0 {
 				log.Printf("[ALERT] [%s/%s] %s workflow '%s' (type: %s) on task queue '%s' still has %d poller(s)",
 					tc.Host, tc.Namespace, status, wf.WorkflowID, wf.WorkflowType, wf.TaskQueue, pollerCount)
+
+				payload := RedundantWorkerPayload{
+					Host:         tc.Host,
+					Port:         tc.Port,
+					Namespace:    tc.Namespace,
+					WorkflowID:   wf.WorkflowID,
+					RunID:        wf.RunID,
+					WorkflowType: wf.WorkflowType,
+					TaskQueue:    wf.TaskQueue,
+					Status:       status,
+					PollerCount:  pollerCount,
+				}
+				go callHandler(handlers.RedundantWorker, payload)
 			}
 		}
 	}
@@ -229,6 +309,14 @@ func main() {
 		defer c.Client.Close()
 	}
 
+	handlers := &cfg.Monitoring.Handlers
+	if handlers.LostWorker != "" {
+		log.Printf("Handler for lost worker: %s", handlers.LostWorker)
+	}
+	if handlers.RedundantWorker != "" {
+		log.Printf("Handler for redundant worker: %s", handlers.RedundantWorker)
+	}
+
 	ctx := context.Background()
 
 	sigChan := make(chan os.Signal, 1)
@@ -245,8 +333,8 @@ func main() {
 		case <-ticker.C:
 			log.Println("Checking for issues...")
 			for _, tc := range clients {
-				checkRunningWithNoPollers(ctx, tc)
-				checkCompletedWithPollers(ctx, tc)
+				checkRunningWithNoPollers(ctx, tc, handlers)
+				checkCompletedWithPollers(ctx, tc, handlers)
 			}
 		case <-sigChan:
 			log.Println("Shutting down...")

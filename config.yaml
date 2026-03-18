@@ -9,3 +9,6 @@ temporal:
 
 monitoring:
   poll_interval_seconds: 30
+  handlers:
+    lost_worker: "/path/to/handler/lost-worker"
+    redundant_worker: "/path/to/handler/redundant-worker"
