@@ -10,16 +10,16 @@ temporal:
     - host: "localhost"
       port: 7233
       namespace: "default"
+      poll_interval_seconds: 30
+      handlers:
+        lost_worker: "/path/to/handler/lost-worker"
+        redundant_worker: "/path/to/handler/redundant-worker"
     - host: "prod.temporal.io"
       port: 7233
       namespace: "production"
-
-monitoring:
-  poll_interval_seconds: 30
-  handlers:
-    lost_worker: "/path/to/handler/lost-worker"
-    redundant_worker: "/path/to/handler/redundant-worker"
-
+      poll_interval_seconds: 60
+      handlers:
+        lost_worker: "https://example.com/webhook"
 ```
 
 ## How it works

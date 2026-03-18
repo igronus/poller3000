@@ -20,25 +20,23 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type Target struct {
-	Host      string `yaml:"host"`
-	Port      int    `yaml:"port"`
-	Namespace string `yaml:"namespace"`
-}
-
 type Handlers struct {
 	LostWorker      string `yaml:"lost_worker"`
 	RedundantWorker string `yaml:"redundant_worker"`
+}
+
+type Target struct {
+	Host                string   `yaml:"host"`
+	Port                int      `yaml:"port"`
+	Namespace           string   `yaml:"namespace"`
+	PollIntervalSeconds int      `yaml:"poll_interval_seconds"`
+	Handlers            Handlers `yaml:"handlers"`
 }
 
 type Config struct {
 	Temporal struct {
 		Targets []Target `yaml:"targets"`
 	} `yaml:"temporal"`
-	Monitoring struct {
-		PollIntervalSeconds int      `yaml:"poll_interval_seconds"`
-		Handlers            Handlers `yaml:"handlers"`
-	} `yaml:"monitoring"`
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -52,10 +50,6 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
-	if cfg.Monitoring.PollIntervalSeconds == 0 {
-		cfg.Monitoring.PollIntervalSeconds = 30
-	}
-
 	for i := range cfg.Temporal.Targets {
 		if cfg.Temporal.Targets[i].Port == 0 {
 			cfg.Temporal.Targets[i].Port = 7233
@@ -66,17 +60,22 @@ func loadConfig(path string) (*Config, error) {
 		if cfg.Temporal.Targets[i].Host == "" {
 			cfg.Temporal.Targets[i].Host = "localhost"
 		}
+		if cfg.Temporal.Targets[i].PollIntervalSeconds == 0 {
+			cfg.Temporal.Targets[i].PollIntervalSeconds = 30
+		}
 	}
 
 	return &cfg, nil
 }
 
 type TemporalClient struct {
-	Client    client.Client
-	Service   workflowservice.WorkflowServiceClient
-	Host      string
-	Port      int
-	Namespace string
+	Client              client.Client
+	Service             workflowservice.WorkflowServiceClient
+	Host                string
+	Port                int
+	Namespace           string
+	Handlers            Handlers
+	PollIntervalSeconds int
 }
 
 func connectToTarget(target Target) (*TemporalClient, error) {
@@ -91,11 +90,13 @@ func connectToTarget(target Target) (*TemporalClient, error) {
 	}
 
 	return &TemporalClient{
-		Client:    c,
-		Service:   c.WorkflowService(),
-		Host:      target.Host,
-		Port:      target.Port,
-		Namespace: target.Namespace,
+		Client:              c,
+		Service:             c.WorkflowService(),
+		Host:                target.Host,
+		Port:                target.Port,
+		Namespace:           target.Namespace,
+		Handlers:            target.Handlers,
+		PollIntervalSeconds: target.PollIntervalSeconds,
 	}, nil
 }
 
@@ -202,7 +203,7 @@ func getWorkflowsByStatus(ctx context.Context, c client.Client, namespace, statu
 	return workflows, nil
 }
 
-func checkRunningWithNoPollers(ctx context.Context, tc *TemporalClient, handlers *Handlers) {
+func checkRunningWithNoPollers(ctx context.Context, tc *TemporalClient) {
 	runningWorkflows, err := getWorkflowsByStatus(ctx, tc.Client, tc.Namespace, "Running")
 	if err != nil {
 		log.Printf("[%s/%s] Error getting running workflows: %v", tc.Host, tc.Namespace, err)
@@ -235,12 +236,12 @@ func checkRunningWithNoPollers(ctx context.Context, tc *TemporalClient, handlers
 				WorkflowType: wf.WorkflowType,
 				TaskQueue:    wf.TaskQueue,
 			}
-			go callHandler(handlers.LostWorker, payload)
+			go callHandler(tc.Handlers.LostWorker, payload)
 		}
 	}
 }
 
-func checkCompletedWithPollers(ctx context.Context, tc *TemporalClient, handlers *Handlers) {
+func checkCompletedWithPollers(ctx context.Context, tc *TemporalClient) {
 	statuses := []string{"Completed", "Terminated", "Canceled", "Failed"}
 
 	for _, status := range statuses {
@@ -282,7 +283,7 @@ func checkCompletedWithPollers(ctx context.Context, tc *TemporalClient, handlers
 					Status:       status,
 					PollerCount:  pollerCount,
 				}
-				go callHandler(handlers.RedundantWorker, payload)
+				go callHandler(tc.Handlers.RedundantWorker, payload)
 			}
 		}
 	}
@@ -322,36 +323,52 @@ func main() {
 		defer c.Client.Close()
 	}
 
-	handlers := &cfg.Monitoring.Handlers
-	if handlers.LostWorker != "" {
-		log.Printf("Handler for lost worker: %s", handlers.LostWorker)
-	}
-	if handlers.RedundantWorker != "" {
-		log.Printf("Handler for redundant worker: %s", handlers.RedundantWorker)
-	}
-
 	ctx := context.Background()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	ticker := time.NewTicker(time.Duration(cfg.Monitoring.PollIntervalSeconds) * time.Second)
-	defer ticker.Stop()
+	type clientTicker struct {
+		client *TemporalClient
+		ticker *time.Ticker
+	}
 
-	log.Printf("Starting monitoring (poll interval: %d seconds, %d targets)",
-		cfg.Monitoring.PollIntervalSeconds, len(clients))
+	var tickers []clientTicker
+	for _, tc := range clients {
+		tickers = append(tickers, clientTicker{
+			client: tc,
+			ticker: time.NewTicker(time.Duration(tc.PollIntervalSeconds) * time.Second),
+		})
+
+		if tc.Handlers.LostWorker != "" {
+			log.Printf("[%s/%s] Lost worker handler: %s", tc.Host, tc.Namespace, tc.Handlers.LostWorker)
+		}
+		if tc.Handlers.RedundantWorker != "" {
+			log.Printf("[%s/%s] Redundant worker handler: %s", tc.Host, tc.Namespace, tc.Handlers.RedundantWorker)
+		}
+	}
+
+	for _, t := range tickers {
+		defer t.ticker.Stop()
+	}
+
+	log.Printf("Starting monitoring (%d targets)", len(clients))
 
 	for {
 		select {
-		case <-ticker.C:
-			log.Println("Checking for issues...")
-			for _, tc := range clients {
-				checkRunningWithNoPollers(ctx, tc, handlers)
-				checkCompletedWithPollers(ctx, tc, handlers)
-			}
 		case <-sigChan:
 			log.Println("Shutting down...")
 			return
+		default:
+			for _, ct := range tickers {
+				select {
+				case <-ct.ticker.C:
+					checkRunningWithNoPollers(ctx, ct.client)
+					checkCompletedWithPollers(ctx, ct.client)
+				default:
+				}
+			}
+			time.Sleep(time.Second)
 		}
 	}
 }
